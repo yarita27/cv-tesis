@@ -53,7 +53,7 @@ os.makedirs(output_dir, exist_ok=True)
 saved_crops = set()
 
 # === VIDEO & DETECCIÓN ===
-VIDEO_SOURCE = r"videocamara1_procesado2.mp4" 
+VIDEO_SOURCE = r"videos/videocamara1_procesado2.mp4" 
 DETECTION_DOWNSCALE = 1.0  # 1.0 = sin downscale. Si luego necesitas velocidad, prueba 0.75 o 0.5
 
 # Activar optimizaciones de GPU para PyTorch

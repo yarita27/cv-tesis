@@ -1,0 +1,5 @@
+Track ID,Tipo,ROI final,Velocidad (km/h),Color (vivo),Color (best),Best Crop,Fecha y Hora
+1,car,ROI1,7.36,gris,negro,vehiculos_recortados\vehiculo_1_best.png,2025-04-01 12:08:50
+3,car,ROI2,9.53,azul,azul,vehiculos_recortados\vehiculo_3_best.png,2025-04-01 12:09:02
+5,car,ROI1,7.36,gris,vinotinto,vehiculos_recortados\vehiculo_5_best.png,2025-04-01 12:10:00
+6,car,ROI1,7.36,gris,gris,vehiculos_recortados\vehiculo_6_best.png,2025-04-01 12:10:07
