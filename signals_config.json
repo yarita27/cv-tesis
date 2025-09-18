@@ -1,0 +1,18 @@
+{
+  "primary_signal_id": "S1",
+  "show_only_primary": true,
+  "mqtt": {
+    "host": "192.168.0.115",
+    "port": 1883,
+    "topic_prefix": "esp32/semaforos/"
+  },
+  "signals": [
+    { "id": "S1", "label": "ARRU", "overlay": { "x": 40, "y": 60 } },
+    { "id": "S2", "label": "CROS", "overlay": { "x": 40, "y": 120 } }
+  ],
+  "bootstrap_state": {
+    "S1": { "state": "RED", "icon": "CROS" },
+    "S2": { "state": "GREEN", "icon": "ARRD" }
+  },
+  "stale_after_sec": 5.0
+}
