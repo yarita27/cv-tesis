@@ -75,7 +75,21 @@ events_fired = {}        # track_id -> set({"STOPLINE_CROSS", "CROSSWALK_BLOCK",
 event_last_ms = {}       # (track_id, event_code) -> último ms (para cooldown)
 EVENT_COOLDOWN_MS = 1500 # evita repetir EXACTAMENTE el mismo evento muy seguido
 
+# Control de infracciones por track y por tipo
+infra_seen = set()             # {(track_id, infr_code)} -> ya registrada 1 vez
+infra_last_ms = {}             # {(track_id, infr_code)} -> último ms (cooldown)
 
+INFRA_COOLDOWN_MS = 1500       # 1.5s típico, ajusta por tipo si quieres
+
+# Umbral de prueba (3 km/h, cámbialo en producción)
+SPEED_LIMIT_KMH = 3.0
+
+# ====== Contra-sentido (config + estado) ======
+WRONGWAY_MAX_MS = 15000   # ventana máx. entre cruces B→A para confirmarlo (15s)
+MIN_PROJ_PX = 1.5         # avance mínimo hacia A en px por frame para considerar "va hacia A" antes 4.0; prueba 1.0–2.0 si sigue sin disparar
+
+wrongway_prog = {}        # track_id -> {"first":"END"/"START", "t_first":ms}
+AB_UNIT = None
 
 PALETTE = [(0,255,0),(255,0,0),(0,255,255),(255,0,255),(0,128,255),(255,128,0),(128,255,128)]
 def roi_color(roi_id):
@@ -494,6 +508,70 @@ def crosswalk_id_by_point(pt, polys):
             return f"XW{i}"
     return None
 
+def log_infraction(timestamp_str, ms_video, track_id, roi, infraccion, valor, umbral, img_path, nota=""):
+    with open(INFRA_CSV_PATH, "a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow([timestamp_str, int(ms_video), track_id, roi, infraccion, valor or "", umbral or "", img_path or "", nota or ""])
+
+def _save_infraction_snapshot(frame, x1, y1, x2, y2, prefix):
+    h, w = frame.shape[:2]
+    x1 = max(0, min(w-1, x1)); x2 = max(0, min(w-1, x2))
+    y1 = max(0, min(h-1, y1)); y2 = max(0, min(h-1, y2))
+    if x2 <= x1 or y2 <= y1:
+        pad = 10
+        x1 = max(0, x1 - pad); y1 = max(0, y1 - pad)
+        x2 = min(w-1, x2 + pad); y2 = min(h-1, y2 + pad)
+    crop = frame[y1:y2, x1:x2]
+    if crop.size == 0:
+        return None
+    fname = f"{prefix}.jpg"
+    fpath = os.path.join(INFRA_IMG_DIR, fname)
+    cv2.imwrite(fpath, crop)
+    return fpath
+
+def emit_infraction_once(track_id, infr_code, ms_video, ts_str, roi, frame, bbox_xyxy, valor=None, umbral=None, nota=""):
+    key = (track_id, infr_code)
+    if key in infra_seen:
+        return False
+    img_path = _save_infraction_snapshot(frame, *bbox_xyxy, f"{infr_code}_tid{track_id}_{int(ms_video)}")
+    log_infraction(ts_str, ms_video, track_id, roi, infr_code, valor, umbral, img_path, nota)
+    infra_seen.add(key)
+    return True
+
+def emit_infraction_cooldown(track_id, infr_code, ms_video, ts_str, roi, frame, bbox_xyxy, valor=None, umbral=None, nota="", cooldown_ms=INFRA_COOLDOWN_MS):
+    key = (track_id, infr_code)
+    last = infra_last_ms.get(key, -1e18)
+    if ms_video - last < cooldown_ms:
+        return False
+    img_path = _save_infraction_snapshot(frame, *bbox_xyxy, f"{infr_code}_tid{track_id}_{int(ms_video)}")
+    log_infraction(ts_str, ms_video, track_id, roi, infr_code, valor, umbral, img_path, nota)
+    infra_last_ms[key] = ms_video
+    return True
+
+def _mid(p1, p2):
+    """Devuelve el punto medio entre dos puntos (x, y)."""
+    return ((p1[0] + p2[0]) / 2.0, (p1[1] + p2[1]) / 2.0)
+
+def recompute_ab_unit():
+    """Recalcula el vector unitario A->B usando line_start y line_end."""
+    global AB_UNIT
+    if len(line_start) == 2 and len(line_end) == 2:
+        A_mid = _mid(line_start[0], line_start[1])
+        B_mid = _mid(line_end[0], line_end[1])
+        vx, vy = (B_mid[0]-A_mid[0], B_mid[1]-A_mid[1])
+        norm = (vx*vx + vy*vy) ** 0.5
+        AB_UNIT = (vx/(norm+1e-9), vy/(norm+1e-9))
+    else:
+        AB_UNIT = None
+
+def moving_towards_A(prevc, currc, min_proj_px=2.0):
+    """Proyección del movimiento sobre el eje A→B. Negativo => hacia A."""
+    if AB_UNIT is None or prevc is None:
+        return False
+    dx = currc[0]-prevc[0]; dy = currc[1]-prevc[1]
+    proj = dx*AB_UNIT[0] + dy*AB_UNIT[1]
+    return proj < -min_proj_px
+
 
 #Carga de modelos YOLOV8
 _device = 'cuda' if (torch.cuda.is_available()) else 'cpu'
@@ -518,6 +596,17 @@ with open(ALL_EVENTS_PATH, "w", newline="", encoding="utf-8") as f:
     import csv
     w = csv.writer(f)
     w.writerow(["timestamp","ms_video","track_id","roi","tipo","nota","img_path"])
+
+# === Infracciones: carpeta por ejecución (separada) ===
+INFRA_RUN_DIR = os.path.join("infracciones", f"{BASE}_{RUN_TAG}")
+INFRA_IMG_DIR = os.path.join(INFRA_RUN_DIR, "img")
+os.makedirs(INFRA_IMG_DIR, exist_ok=True)
+
+INFRA_CSV_PATH = os.path.join(INFRA_RUN_DIR, "infracciones.csv")
+# Cabecera de infracciones
+with open(INFRA_CSV_PATH, "w", newline="", encoding="utf-8") as f:
+    w = csv.writer(f)
+    w.writerow(["timestamp","ms_video","track_id","roi","infraccion","valor","umbral","img_path","nota"])
 
 # Intentar cargar geometría desde JSON asociado al video
 geo = load_geometry_for_video(VIDEO_SOURCE)
@@ -554,6 +643,8 @@ if geo:
     STOP_LINE_RAW = geo["lines"].get("stop_line", [])
     STOP_LINE = [tuple(map(int, STOP_LINE_RAW[0])), tuple(map(int, STOP_LINE_RAW[1]))] if len(STOP_LINE_RAW) == 2 else []
     speed_distance_m = float(geo.get("speed_distance_m", speed_distance_m))
+    recompute_ab_unit()  # calcula AB_UNIT a partir de line_start/line_end
+
 else:
     # Si no hay JSON válido, evita NameError y sigue sin STOP/CEBRA
     CROSSWALKS_POLYS = []
@@ -714,10 +805,6 @@ def detection_and_tracking(raw_queue, processed_queue, stop_event):
             # Actualiza estado de cebra para el próximo frame
             prev_in_crosswalk[track_id] = en_cebra
 
-
-
-            # 3.3 SIEMPRE actualiza el centro al final
-            track_prev_center[track_id] = (cx, cy)
             
             actual_roi = "fuera"
 
@@ -793,18 +880,54 @@ def detection_and_tracking(raw_queue, processed_queue, stop_event):
                         vehicle_times[track_id] = {'start': pos_msec, 'end': None}
                         print(f"[🚦 START] Vehículo {track_id} cruzó línea de inicio en {pos_msec:.0f} ms")
 
+                    # Confirmar contravía B->A dentro de ventana
+                    prog = wrongway_prog.get(track_id)
+                    if prog and prog.get("first") == "END" and (pos_msec - prog["t_first"]) <= WRONGWAY_MAX_MS:
+                        roi_for_event = roi_by_bbox(x1, y1, x2, y2, rois, min_ratio=0.2) or "fuera"
+                        bbox_xyxy = (x1, y1, x2, y2)
+                        note = "Ingresó por B y retrocedió hacia A"
+                        emit_infraction_once(track_id, "WRONG_WAY", pos_msec, timestamp_str,
+                                            roi_for_event, frame, bbox_xyxy, valor="", umbral="", nota=note)
+                        cv2.putText(frame, "WRONG_WAY", (x1, max(20, y1-55)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
+                    # limpiar en cualquier caso
+                    wrongway_prog.pop(track_id, None)
+
+
             if len(line_end) == 2:
-                if track_id in vehicle_times and vehicle_times[track_id]['end'] is None:
-                    if cruzo_linea(line_end[0], line_end[1], prev_center, curr_center):
+                # Centros para chequear cruce y dirección
+                prevc = track_prev_center.get(track_id)
+                currc = (cx, cy)
+
+                # 1) Detectar cruce de B SIEMPRE (independiente de vehicle_times)
+                if prevc is not None and cruzo_linea(line_end[0], line_end[1], prevc, currc):
+                    # Debug opcional de proyección
+                    if AB_UNIT is not None:
+                        dx, dy = currc[0]-prevc[0], currc[1]-prevc[1]
+                        proj = dx*AB_UNIT[0] + dy*AB_UNIT[1]
+                        print(f"[DBG] B-cross tid={track_id} proj={proj:.2f} (negativo=hacia A) ms={int(pos_msec)}")
+
+                    # Si aún NO hay 'start' (no cruzó A), y se mueve hacia A => siembra B-primero
+                    vt = vehicle_times.get(track_id)
+                    start_exists = (vt is not None) and (vt.get('start') is not None)
+                    if not start_exists and moving_towards_A(prevc, currc):
+                        wrongway_prog.setdefault(track_id, {"first":"END", "t_first": pos_msec})
+
+                    # 2) Sólo si YA HAY 'start' y NO tiene 'end', usamos B como fin para velocidad
+                    if start_exists and vt.get('end') is None:
                         vehicle_times[track_id]['end'] = pos_msec
+
+                        # arma timestamp aquí (mismo scope que speed)
                         event_time = video_start_time + timedelta(milliseconds=pos_msec)
                         timestamp_str = event_time.strftime('%Y-%m-%d %H:%M:%S')
+
                         t1 = vehicle_times[track_id]['start']
                         t2 = vehicle_times[track_id]['end']
                         if t1 is not None:
-                            elapsed = (t2 - t1) / 1000.0  # segundos
+                            elapsed = (t2 - t1) / 1000.0
                             if elapsed > 0:
                                 speed = (speed_distance_m / elapsed) * 3.6
+
                                 vehicle_speeds[track_id] = {
                                     "velocidad": round(speed, 2),
                                     "timestamp": timestamp_str,
@@ -818,7 +941,22 @@ def detection_and_tracking(raw_queue, processed_queue, stop_event):
                                     "timestamp": timestamp_str
                                 }
                                 print(f"[🏁 END] Vehículo {track_id} - Tiempo: {elapsed:.2f} s - Velocidad: {speed:.2f} km/h")
-                        cv2.putText(frame, f"END: {track_id}", (10, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,0,0), 2)
+                                cv2.putText(frame, f"END: {track_id}", (10, 140),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,0,0), 2)
+
+                                # 🚨 Exceso de velocidad — MOVER AQUÍ ADENTRO
+                                roi_for_event = roi_by_bbox(x1, y1, x2, y2, rois, min_ratio=0.2) or "fuera"
+                                bbox_xyxy = (x1, y1, x2, y2)
+                                if speed > SPEED_LIMIT_KMH:
+                                    note = f"Vel {speed:.2f} km/h > {SPEED_LIMIT_KMH:.2f}"
+                                    if emit_infraction_once(track_id, "SPEEDING", pos_msec, timestamp_str,
+                                                            roi_for_event, frame, bbox_xyxy,
+                                                            valor=f"{speed:.2f}", umbral=f"{SPEED_LIMIT_KMH:.2f}", nota=note):
+                                        cv2.putText(frame, f"SPEEDING {speed:.1f} km/h", (x1, y1-30),
+                                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2)
+
+
+
 
             # Overlay
             # === Overlay (una sola vez, basado en estado en vivo) ===
@@ -856,6 +994,8 @@ def detection_and_tracking(raw_queue, processed_queue, stop_event):
                 cv2.putText(frame, f"{vehicle_speeds[track_id]['velocidad']} km/h", (x1, y_text),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
 
+            # 3.3 SIEMPRE actualiza el centro al final
+            track_prev_center[track_id] = (cx, cy)
 
         # Cerrar tracks que desaparecieron sin cruzar fuera (p. ej. se perdió el track)
         if SAVE_ON_DISAPPEAR_AFTER_MS is not None:
@@ -878,6 +1018,7 @@ def detection_and_tracking(raw_queue, processed_queue, stop_event):
                     on_crosswalk_frames.pop(tid, None)
                     on_stop_frames.pop(tid, None)
                     prev_in_crosswalk.pop(tid, None)
+                    wrongway_prog.pop(tid, None)
 
                     # Opcional: limpiar historial de eventos del track
                     events_fired.pop(tid, None)
