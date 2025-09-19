@@ -1,20 +1,35 @@
-import json, time, threading, re
+import re
+import time
+import threading
 from dataclasses import dataclass, field
 from typing import Dict, Optional
-import paho.mqtt.client as mqtt
-import cv2
 
-# --------------------------
-# Utilidades y estructuras
-# --------------------------
+# SSH
+import socket
+import paramiko
+
+# UI y JSON
+import json
+import cv2
+import numpy as np
+
+# =========================
+# Parseo de payload/colores
+# =========================
+PAYLOAD_RE = re.compile(r"^\s*(RED|YELLOW|GREEN)\s+ICON:([A-Z]+)\s*$", re.IGNORECASE)
+JOURNAL_RE = re.compile(r"\[MQTT\]\s+([^\s]+)\s*=>\s*(.+)$")  # [MQTT] esp32/semaforos/S1 => GREEN ICON:ARRU
+
 COLOR_BGR = {
     "RED":    (0, 0, 255),
     "YELLOW": (0, 255, 255),
     "GREEN":  (0, 255, 0),
-    "GRAY":   (128, 128, 128)
+    "GRAY":   (128, 128, 128),
 }
 
-PAYLOAD_RE = re.compile(r"^\s*(RED|YELLOW|GREEN)\s+ICON:([A-Z]+)\s*$", re.IGNORECASE)
+# =========================
+# Estado por semáforo (ID)
+# =========================
+# ... imports arriba iguales ...
 
 @dataclass
 class SignalSample:
@@ -23,104 +38,185 @@ class SignalSample:
     ts: float = field(default_factory=time.time)
 
 class SemaforoState:
-    """Estado thread-safe de varios semáforos."""
-    def __init__(self, stale_after_sec: float = 5.0):
+    """
+    Buffer por-ID (S1, S2, ...). Mantiene:
+    - último estado e instante por cada ID
+    - latido de conexión (last_link_ok_ts)
+    """
+    def __init__(self, stale_after_sec: float = 5.0, hold_state_sec: float = 30.0, link_stale_sec: float = 3.0):
         self._lock = threading.Lock()
         self._data: Dict[str, SignalSample] = {}
-        self._stale_after = stale_after_sec
+        # (stale_after_sec ya no se usa para grisar la luz)
+        self._state_hold = float(hold_state_sec)
+        self._link_stale = float(link_stale_sec)
+        self._last_link_ok_ts = 0.0
 
+    # --- Conectividad ---
+    def link_heartbeat(self):
+        with self._lock:
+            self._last_link_ok_ts = time.time()
+
+    def link_down(self):
+        # no borramos estados; solo marcamos que no hay latido
+        with self._lock:
+            # ponerlo "viejo" para que caiga en stale rápido, pero sin tocar colores
+            self._last_link_ok_ts = 0.0
+
+    def link_is_stale(self) -> bool:
+        with self._lock:
+            if self._last_link_ok_ts <= 0.0:
+                return True
+            return (time.time() - self._last_link_ok_ts) > self._link_stale
+
+    # --- Estados de luces ---
     def bootstrap(self, snapshot: Dict[str, Dict[str, str]]):
         with self._lock:
             now = time.time()
             for sid, info in snapshot.items():
-                st = info.get("state", "GRAY").upper()
+                st = (info.get("state") or "GRAY").upper()
                 ic = info.get("icon")
-                self._data[sid] = SignalSample(state=st, icon=ic, ts=now)
+                self._data[sid.upper()] = SignalSample(state=st, icon=ic, ts=now)
 
-    def update_from_mqtt(self, sid: str, payload: str):
-        m = PAYLOAD_RE.match(payload)
+    def update_from_log(self, sid: str, payload: str):
+        m = PAYLOAD_RE.match(payload or "")
         if not m:
-            # Payload no reconocido -> no pisar estado válido anterior
             return
         state = m.group(1).upper()
         icon = m.group(2).upper()
         with self._lock:
-            self._data[sid] = SignalSample(state=state, icon=icon, ts=time.time())
+            self._data[sid.upper()] = SignalSample(state=state, icon=icon, ts=time.time())
 
     def get_view(self, sid: str) -> SignalSample:
+        """
+        Devuelve el último estado. NO lo vuelve GRAY por conexión.
+        Solo lo pone GRAY si el estado está más viejo que hold_state_sec.
+        """
         with self._lock:
-            s = self._data.get(sid, SignalSample())
-            # Marcar gris si está "stale"
-            if (time.time() - s.ts) > self._stale_after:
+            s = self._data.get(sid.upper(), SignalSample())
+            age = time.time() - s.ts if s.ts else 1e9
+            if age > self._state_hold:
                 return SignalSample(state="GRAY", icon=s.icon, ts=s.ts)
             return s
 
-class MQTTSemaforoBridge(threading.Thread):
-    """Suscriptor MQTT que alimenta SemaforoState."""
-    def __init__(self, host: str, port: int, topic_prefix: str, signals_ids, state: SemaforoState, username="", password=""):
+# =========================
+# Hilo SSH: tail de journal
+# =========================
+class SSHSemaforoBridge(threading.Thread):
+    """
+    Conecta por SSH a la Raspberry y sigue el log:
+      journalctl -u scheduler-mqtt -f
+    Parsea líneas tipo:
+      [MQTT] esp32/semaforos/S1 => GREEN ICON:ARRU
+    y actualiza el estado del ID correspondiente.
+    """
+    def __init__(self, host: str, username: str, password: str, command: str,
+                 topic_prefix: str, signals_ids, state: SemaforoState,
+                 port: int = 22, reconnect_sec: float = 3.0):
         super().__init__(daemon=True)
         self.host = host
         self.port = port
+        self.username = username
+        self.password = password
+        self.command = command
         self.topic_prefix = topic_prefix.rstrip('/') + '/'
-        self.signals_ids = list(signals_ids)
+        self.signals_whitelist = set([sid.upper() for sid in signals_ids])  # IDs permitidos (S1, S2, ...)
         self.state = state
-        self.client = mqtt.Client()
-        if username or password:
-            self.client.username_pw_set(username, password)
-        self.client.on_connect = self._on_connect
-        self.client.on_message = self._on_message
+        self.reconnect_sec = reconnect_sec
+        self._stop = threading.Event()
 
-    def _on_connect(self, client, userdata, flags, rc):
-        # Suscribirse a cada S* explicitamente
-        for sid in self.signals_ids:
-            t = f"{self.topic_prefix}{sid}"
-            client.subscribe(t, qos=1)
+    def stop(self):
+        self._stop.set()
 
-    def _on_message(self, client, userdata, msg):
-        # topic ej: esp32/semaforos/S1 -> sid = S1
-        sid = msg.topic.split('/')[-1].upper()
-        payload = msg.payload.decode('utf-8', errors='ignore')
-        self.state.update_from_mqtt(sid, payload)
+    def _handle_line(self, line: str):
+        m = JOURNAL_RE.search(line)
+        if not m:
+            return
+        topic = m.group(1).strip()    # ej: esp32/semaforos/S1
+        payload = m.group(2).strip()  # ej: GREEN ICON:ARRU
+
+        # prefijo y extracción de ID
+        if not topic.startswith(self.topic_prefix):
+            return
+        sid = topic.split('/')[-1].upper()
+        if self.signals_whitelist and sid not in self.signals_whitelist:
+            return
+
+        # actualizar estado
+        self.state.update_from_log(sid, payload)
 
     def run(self):
-        self.client.connect(self.host, self.port, 60)
-        self.client.loop_forever()
+        while not self._stop.is_set():
+            client = None
+            try:
+                client = paramiko.SSHClient()
+                client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                client.connect(self.host, port=self.port, username=self.username,
+                               password=self.password, timeout=10.0)
+                transport = client.get_transport()
+                chan = transport.open_session()
+                chan.exec_command(self.command)  # follow
 
-# --------------------------
-# Overlay en OpenCV
-# --------------------------
+                buff = b""
+                while not self._stop.is_set() and not chan.exit_status_ready():
+                    if chan.recv_ready():
+                        chunk = chan.recv(4096)
+                        if not chunk:
+                            break
+                        buff += chunk
+                        while b"\n" in buff:
+                            line, buff = buff.split(b"\n", 1)
+                            try:
+                                self._handle_line(line.decode("utf-8", errors="ignore"))
+                            except Exception:
+                                pass
+                    else:
+                        time.sleep(0.05)
+            except (paramiko.SSHException, socket.error, TimeoutError):
+                time.sleep(self.reconnect_sec)
+            except Exception:
+                time.sleep(self.reconnect_sec)
+            finally:
+                try:
+                    if client:
+                        client.close()
+                except Exception:
+                    pass
+
+# =========================
+# Utilidades de overlay
+# =========================
 def draw_signal_overlays(frame, cfg: dict, state: SemaforoState):
     primary = (cfg.get("primary_signal_id") or "").upper()
     only_primary = bool(cfg.get("show_only_primary", False))
+
     for s in cfg["signals"]:
         sid = s["id"].upper()
         if only_primary and sid != primary:
             continue
+
         pos = (int(s["overlay"]["x"]), int(s["overlay"]["y"]))
         sample = state.get_view(sid)
         color = COLOR_BGR.get(sample.state, COLOR_BGR["GRAY"])
 
-        # Estilo distinto si es el semáforo principal
         is_primary = (sid == primary)
         radius = 20 if is_primary else 14
         border = 3 if is_primary else 2
 
-        # Círculo
+        # círculo
         cv2.circle(frame, pos, radius, color, thickness=-1)
         cv2.circle(frame, pos, radius, (0, 0, 0), thickness=border)
 
-        # Etiqueta: añade estrella si es el principal
+        # etiqueta
         label = sid
         if sample.icon:
             label += f" · {sample.icon}"
         if is_primary:
-            label = "★ " + label  # marca visual del local
+            label = "★ " + label
 
         cv2.putText(frame, label, (pos[0] + radius + 12, pos[1] + 6),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
         cv2.putText(frame, label, (pos[0] + radius + 12, pos[1] + 6),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 1, cv2.LINE_AA)
-
 
 def load_signals_config(path="signals_config.json"):
     with open(path, "r", encoding="utf-8") as f:
