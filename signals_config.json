@@ -4,21 +4,23 @@
   "show_only_primary": true,
   "hold_state_sec": 30.0,
   "link_stale_sec": 3.0,
+  "rtsp_latency_ms": 700,             
+  "lat_max_safe_ms": 2500,     
   "ssh": {
     "host": "192.168.0.115",
     "port": 22,
     "username": "arthur",
     "password": "acanga",
-    "command": "journalctl -u scheduler-mqtt -f",
-    "parse": { "topic_prefix": "esp32/semaforos/" }
+    "command": "journalctl -u scheduler-mqtt -f -o cat",
+    "parse": { "topic_prefix": "semaforos/" }
   },
   "signals": [
     { "id": "S1", "label": "VIA-PRINCIPAL", "overlay": { "x": 40, "y": 60 } },
     { "id": "S2", "label": "VECINO", "overlay": { "x": 40, "y": 120 } }
   ],
   "bootstrap_state": {
-    "S1": { "state": "RED", "icon": "CROS" },
-    "S2": { "state": "GREEN", "icon": "ARRD" }
+    "S1": { "state": "GRAY", "icon": "" },
+    "S2": { "state": "GRAY", "icon": "" }
   },
   "stale_after_sec": 5.0
 }

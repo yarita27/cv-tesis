@@ -3,6 +3,8 @@ import time
 import threading
 from dataclasses import dataclass, field
 from typing import Dict, Optional
+from collections import deque
+
 
 # SSH
 import socket
@@ -17,7 +19,8 @@ import numpy as np
 # Parseo de payload/colores
 # =========================
 PAYLOAD_RE = re.compile(r"^\s*(RED|YELLOW|GREEN)\s+ICON:([A-Z]+)\s*$", re.IGNORECASE)
-JOURNAL_RE = re.compile(r"\[MQTT\]\s+([^\s]+)\s*=>\s*(.+)$")  # [MQTT] esp32/semaforos/S1 => GREEN ICON:ARRU
+#JOURNAL_RE = re.compile(r"\[MQTT\]\s+([^\s]+)\s*=>\s*(.+)$")  # [MQTT] esp32/semaforos/S1 => GREEN ICON:ARRU
+JOURNAL_RE = re.compile(r"(esp32/semaforos/[A-Za-z0-9_\-]+).*?(?:=>|:)?\s*(.+)$", re.IGNORECASE)
 
 COLOR_BGR = {
     "RED":    (0, 0, 255),
@@ -50,7 +53,34 @@ class SemaforoState:
         self._state_hold = float(hold_state_sec)
         self._link_stale = float(link_stale_sec)
         self._last_link_ok_ts = 0.0
+        self.history = {}  # { "S1": deque([(t_srv, "RED"), ...], maxlen=5000) }
 
+    def _store(self, sid, state, t_epoch, icon=None):
+        sid = sid.upper()
+        # actualiza el estado “en vivo” que usa el HUD
+        with self._lock:
+            self._data[sid] = SignalSample(state=state, icon=icon, ts=float(t_epoch))
+        # además guarda histórico para consultas “al tiempo T”
+        dq = self.history.setdefault(sid, deque(maxlen=5000))
+        dq.append((float(t_epoch), state))
+
+
+    def update_from_log_with_ts(self, sid, state, icon, t_override=None):
+        # t_override: epoch del SERVIDOR si viene en el log ('ts='). Si no, usa reloj local.
+        t = float(t_override) if (t_override is not None) else time.time()
+        self._store(sid, state, t, icon=icon)
+        # mantén aquí cualquier lógica que ya tengas para heartbeat/enlace
+
+    def get_state_at(self, sid, t_query):
+        """Último estado conocido en o antes de t_query (epoch seg, reloj del servidor)."""
+        sid = sid.upper()
+        dq = self.history.get(sid)
+        if not dq:
+            return None
+        for t, st in reversed(dq):
+            if t <= t_query:
+                return {"state": st, "t": t}
+        return None
     # --- Conectividad ---
     def link_heartbeat(self):
         with self._lock:
@@ -128,21 +158,110 @@ class SSHSemaforoBridge(threading.Thread):
         self._stop.set()
 
     def _handle_line(self, line: str):
-        m = JOURNAL_RE.search(line)
-        if not m:
-            return
-        topic = m.group(1).strip()    # ej: esp32/semaforos/S1
-        payload = m.group(2).strip()  # ej: GREEN ICON:ARRU
+        # Ejemplos que recibimos:
+        # [MQTT] semaforos/S1 => GREEN ICON:ARRU
+        # [MQTT] semaforos/S2 => RED ICON:CROS
 
-        # prefijo y extracción de ID
-        if not topic.startswith(self.topic_prefix):
+        if not line:
             return
-        sid = topic.split('/')[-1].upper()
+
+        # 1) Localiza el topic usando el prefijo configurado
+        idx = line.find(self.topic_prefix)
+        if idx < 0:
+            return  # no es para nosotros
+
+        # topic va hasta el siguiente espacio (o fin de línea)
+        j = line.find(' ', idx)
+        if j < 0:
+            j = len(line)
+        topic = line[idx:j].strip()            # ej: "semaforos/S1"
+        sid   = topic.split('/')[-1].upper()   # "S1"
+
         if self.signals_whitelist and sid not in self.signals_whitelist:
             return
 
-        # actualizar estado
-        self.state.update_from_log(sid, payload)
+        # 2) Extrae el payload (después de "=>", si existe; si no, lo que quede)
+        rest = ""
+        if "=>" in line:
+            rest = line.split("=>", 1)[1].strip()
+        else:
+            rest = line[j:].strip()
+
+        # Normalizamos algunas variantes típicas
+        rest_up = rest.upper()
+
+        # Caso feliz: "GREEN ICON:ARRU" (o RED/YELLOW)
+        if rest_up.startswith(("RED","GREEN","YELLOW")):
+            if "ICON:" not in rest_up:
+                rest_up = f"{rest_up} ICON:NA"
+
+            # 1) Extrae ts=... si vino en la línea (usa 'rest', no pierdas nada)
+            t_server = None
+            m_ts = re.search(r"\bts=([0-9]+\.[0-9]+|\d+)\b", rest, flags=re.IGNORECASE)
+            if m_ts:
+                try:
+                    t_server = float(m_ts.group(1))
+                except:
+                    t_server = None
+
+            # 2) Obtén state y icon del payload
+            st = rest_up.split()[0]  # RED/GREEN/YELLOW
+            m_icon = re.search(r"ICON:([A-Z0-9_]+)", rest_up)
+            ic = m_icon.group(1) if m_icon else "NA"
+
+            # 3) Guarda usando el tiempo del servidor si está
+            self.state.update_from_log_with_ts(sid, st, ic, t_override=t_server)
+            self.state.link_heartbeat()
+            return
+
+
+        # Variantes "state=GREEN icon=ARRU", JSON, etc. (fallbacks)
+        # state=...
+        if "STATE=" in rest_up:
+            st = None; ic = None
+            for part in re.split(r"[,\s]+", rest_up):
+                if part.startswith("STATE="):
+                    st = part.split("=",1)[1]
+                elif part.startswith("ICON=") or part.startswith("PHASE=") or part.startswith("MODE="):
+                    ic = part.split("=",1)[1]
+            if st in ("RED","GREEN","YELLOW"):
+                t_server = None
+                m_ts = re.search(r"\bts=([0-9]+\.[0-9]+|\d+)\b", rest, flags=re.IGNORECASE)
+                if m_ts:
+                    try:
+                        t_server = float(m_ts.group(1))
+                    except:
+                        t_server = None
+
+                self.state.update_from_log_with_ts(sid, st, (ic or 'NA'), t_override=t_server)
+                self.state.link_heartbeat()
+                return
+
+
+        # JSON {"state":"GREEN","icon":"ARRU"}
+        try:
+            obj = json.loads(rest)
+            st  = (obj.get("state") or "").upper()
+            ic  = (obj.get("icon")  or obj.get("phase") or obj.get("mode") or "NA").upper()
+            t_server = obj.get("ts", None)  # si el publicador ya manda "ts" en JSON
+
+            if st in ("RED","GREEN","YELLOW"):
+                # intenta convertir ts si vino como string
+                try:
+                    t_server = float(t_server) if t_server is not None else None
+                except:
+                    t_server = None
+
+                self.state.update_from_log_with_ts(sid, st, ic, t_override=t_server)
+                self.state.link_heartbeat()
+                return
+
+        except Exception:
+            pass
+
+        # Si llegamos aquí, al menos marcamos latido para el link
+        self.state.link_heartbeat()
+
 
     def run(self):
         while not self._stop.is_set():
